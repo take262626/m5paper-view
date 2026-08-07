@@ -110,4 +110,8 @@ jobs:
             exit 0
           fi
           git commit -m "render dashboard $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # GAS が index.html を新たに commit していると push が非 fast-forward で reject
+          # されうる（concurrency 制御があるため稀だが、手動 dispatch との競合等で起こりうる）。
+          # rebase して自分の commit をその上に載せ直してから push する。
+          git pull --rebase origin main
           git push
