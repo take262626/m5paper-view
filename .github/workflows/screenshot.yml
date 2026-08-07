@@ -1,0 +1,113 @@
+# M5Paper ダッシュボードの PNG を GitHub Actions 内で撮影する。
+#
+# 【なぜ自前で撮るか】
+#   旧構成は Microlink (api.microlink.io) に GitHub Pages を撮らせていたが、Microlink の
+#   無料枠は 25 リクエスト/日/IP。GAS は Google の共有 egress IP から fetch するため、
+#   世界中の Apps Script 利用者とこの枠を食い合い、実測で約 43% が失敗して HCTI
+#   （月 50 枚の無料枠）へフォールバックしていた。月約 100 枚ペースで無料枠が枯渇し、
+#   更新が完全停止する状態だった。
+#   配信先リポは public なので Actions は無料・実質無制限。撮影を自前に引き取ることで
+#   サードパーティのレート制限から完全に解放される。
+#
+# 【設置場所】
+#   このファイルの実体は配信先リポ take262626/m5paper-view の
+#   .github/workflows/screenshot.yml。ここにあるのは版管理用の原本。
+#   反映手順は M5Paper-dashboard/CLAUDE.md「PNG 生成系統」節を参照。
+
+name: screenshot
+
+on:
+  push:
+    branches: [main]
+    # GAS が publishToPages_ で index.html を commit したときだけ走る。
+    # 本ワークフロー自身が commit する dashboard.png / dashboard.json では
+    # 再発火しないため、無限ループにならない。
+    paths: ['index.html']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # リポジトリ既定は read のため明示が必須
+
+concurrency:
+  group: screenshot
+  cancel-in-progress: true
+
+jobs:
+  shot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # ダッシュボードは Google Fonts の webfont (Noto Sans JP) で日本語を出すため
+      # 通常は不要だが、webfont 取得に失敗したときの豆腐化を防ぐ保険。
+      - name: Install CJK fallback fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+
+      # file:// だと @import の扱いがブラウザ設定に左右されるため HTTP で配信する。
+      - name: Serve page locally
+        run: |
+          python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8080/index.html >/dev/null && exit 0
+            sleep 0.5
+          done
+          echo "::error::ローカルサーバーが起動しませんでした"
+          exit 1
+
+      # ubuntu-latest には Google Chrome がプリインストールされているので追加DLは不要。
+      # --virtual-time-budget がネットワーク静穏（＝webfont 読み込み完了）まで
+      # 仮想時間を進めてからシャッターを切る。
+      - name: Screenshot
+        run: |
+          google-chrome --headless=new --disable-gpu --no-sandbox \
+            --hide-scrollbars --force-device-scale-factor=1 \
+            --window-size=960,540 --virtual-time-budget=10000 \
+            --screenshot=dashboard.png \
+            http://127.0.0.1:8080/index.html
+
+      # 白画像ガード。GAS 側 Constants.gs の BLANK_PNG_MIN_BYTES(2000B) と同じ思想で、
+      # 実測の正常値（約 64KB）に対し十分低い 5KB を下限にする。ここで fail させることで
+      # 白い PNG を commit せず、GAS を Microlink/HCTI のフォールバックへ落とす。
+      - name: Verify PNG
+        run: |
+          test -f dashboard.png || { echo "::error::dashboard.png が生成されていません"; exit 1; }
+          bytes=$(stat -c%s dashboard.png)
+          dims=$(file -b dashboard.png | grep -o '[0-9]\+ x [0-9]\+' | head -1)
+          echo "bytes=${bytes} dims=${dims}"
+          if [ "${bytes}" -lt 5000 ]; then
+            echo "::error::PNG が小さすぎます (${bytes}B < 5000B) — 描画失敗の可能性"
+            exit 1
+          fi
+          if [ "${dims}" != "960 x 540" ]; then
+            echo "::error::PNG のサイズが想定外です (${dims})"
+            exit 1
+          fi
+
+      # index.html に埋まっている nonce を PNG と対応づけて公開する。
+      # GAS はこの nonce の一致を Contents API でポーリングして撮影完了を検知する。
+      - name: Write dashboard.json
+        run: |
+          nonce=$(grep -o 'name="render-nonce" content="[0-9]*"' index.html \
+                  | grep -o '[0-9]\+' | head -1)
+          if [ -z "${nonce}" ]; then
+            echo "::error::index.html から render-nonce を取得できませんでした"
+            exit 1
+          fi
+          printf '{"nonce":"%s","builtAt":"%s","bytes":%s}\n' \
+            "${nonce}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(stat -c%s dashboard.png)" \
+            > dashboard.json
+          cat dashboard.json
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dashboard.png dashboard.json
+          if git diff --cached --quiet; then
+            echo "変更なし（同一内容）のため commit をスキップ"
+            exit 0
+          fi
+          git commit -m "render dashboard $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
